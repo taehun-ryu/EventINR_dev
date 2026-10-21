@@ -1,0 +1,356 @@
+EventINR-main 코드 이해를 위한 컨텍스트
+작성 기준: 2026-10-21, 현재 저장소 소스 및 실행 스크립트
+
+이 문서는 GPT에게 저장소 파일과 함께 전달할 수 있는 코드 안내서다.
+설계 의도, 실제 실행 경로, 데이터·텐서·출력의 의미를 설명한다.
+코드가 변경되면 현재 소스를 우선한다. 실험 성능이나 논문 재현 성공을
+증명하는 문서가 아니며, 확인되지 않은 성능 수치는 포함하지 않는다.
+
+1. 프로젝트의 목적
+
+이벤트 카메라의 event 데이터를 이용해 grayscale intensity image를 복원한다.
+입력 이벤트는 공간 좌표, timestamp, polarity로 구성된다.
+현재 구현은 이벤트를 5-bin voxel grid로 변환하고, recurrent encoder의
+특징과 질의 좌표를 INR(Implicit Neural Representation) decoder에 입력한다.
+학습에는 이벤트와 짝지어진 GT intensity image를 사용한다.
+
+핵심 구조:
+  events -> 5-bin voxels -> recurrent encoder -> feature maps
+         -> 공간/시간 특징 보간 -> coordinate MLP -> intensity
+
+하나의 장면마다 별도 INR을 최적화하는 구조가 아니라, 여러 시퀀스에 대해
+공유하는 encoder와 decoder를 함께 학습하는 feature-conditioned INR이다.
+추론 시 모델의 입력에는 GT intensity가 들어가지 않는다.
+단, 현재 데이터 로더와 벤치마크는 GT timestamp에 맞춘 이벤트 구간을 사용한다.
+
+2. 파일 지도와 실제 실행 경로
+
+train.py
+  학습 진입점. Dataset/DataLoader, 모델 생성, loss, optimizer, validation,
+  preview, checkpoint 저장과 resume을 담당한다.
+  실제 모델 import: from models.model import EventINR
+
+models/model.py
+  현재 사용하는 EventINR 구현.
+  encode(), query(), forward(), render()를 제공한다.
+  SIREN/Fourier ReLU decoder와 sigmoid/linear intensity head를 지원한다.
+
+models/backbone.py
+  현재 모델이 사용하는 E2VIDEncoder, E2VIDPlusEncoder, ETNetEncoder.
+  원래 이미지 출력 head를 제외하고 32채널 공간 특징과 recurrent state를 반환한다.
+
+models/eitr/
+  ET-Net 계열 Transformer 구성 요소.
+  현재 backbone은 transformer_encoder.py와 transformer_decoder.py를 사용한다.
+
+data.py
+  manifest 읽기, NPY/H5 source 통합, clip 구성, augmentation,
+  voxel normalization, EVREAL memmap 입력을 담당한다.
+  주요 클래스: Sequence, Clips, ECDSequence.
+
+h5_data.py
+  ECOCO H5 이벤트/이미지 읽기와 온라인 5-bin voxel 생성.
+  학습용 training_packet()과 평가용 read()의 packet 정의가 다르다.
+
+losses.py
+  output -> intensity 변환, Charbonnier/LPIPS reconstruction loss,
+  선택적 optical-flow 기반 temporal consistency.
+
+evaluate.py
+  학습한 EventINR checkpoint 평가.
+  ECOCO manifest 또는 ECD/HQF/MVSEC/Custom memmap을 지원한다.
+  benchmark 설정 읽기, tone mapping, metric, 영상/CSV/JSON 저장을 담당한다.
+
+eval_utils.py
+  L1/MSE/PSNR/SSIM 및 선택적 LPIPS 계산, 평가 영상 생성.
+
+eval_pretrained.py
+  외부 EVREAL을 사용해 E2VID, E2VID+, ET-Net, HyperE2VID 등의
+  pretrained baseline을 평가하는 별도 경로.
+  EventINR 학습 시 pretrained encoder를 로드하는 코드가 아니다.
+
+script_train.sh / script_eval.sh / script_eval_pretrained.sh
+  SLURM/Conda 및 특정 서버 경로에 맞춘 실행 예시.
+  현재 머신에 맞는 경로와 환경 확인이 필요하다.
+
+models/joint_model.py
+  log-sigmoid 출력을 사용하는 별도 EventINR 구현이 남아 있다.
+  현재 train.py에서 사용하지 않는다.
+
+models/enhanced_encoder.py / models/e2vid_encoder.py
+  별도 backbone/checkpoint 관련 구현이다.
+  현재 models/model.py -> models/backbone.py 경로에 연결되어 있지 않다.
+  이 파일의 기능이 현재 학습에 적용된다고 가정하면 안 된다.
+
+AGENTS.md / CURRENT_STATE.md / codex/tasks/active/ / codex/tasks/archive/
+  작업 규칙·상태·task 관리를 위해 만든 항목이다.
+  이 문서 작성 시점에는 모두 비어 있다.
+
+3. 주요 텐서와 모델 API
+
+기호:
+  B: batch size, S: voxel/feature step 수, H/W: 이미지 높이/너비
+  T: query timestamp 수, Q: query spatial point 수
+
+voxels: [B, S, 5, H, W], float32
+feature times: [B, S], float64
+time_origin: batch item별 시퀀스 시작 시각, float64
+features: [B, S, 32, H, W]
+xy: [B, Q, 2], 정규화된 (x, y) 좌표
+query times: [B, T], float64
+query output: [B, T, Q]
+render output: [B, T, H_out, W_out]
+
+context, states = model.encode(voxels, feature_times, states,
+                               time_origin=time_origin)
+outputs = model.query(context, xy, query_times)
+frames = model.render(context, query_times, height=H_out, width=W_out)
+
+encode()는 voxel을 순차 처리해 특징을 쌓는다.
+context에는 features, times, time_origin이 들어간다.
+states는 다음 구간에 넘길 recurrent state다.
+render()는 pixel-center 좌표를 생성해 query()를 호출하며 no_grad이다.
+학습에는 gradient가 전달되는 query()를 사용한다.
+
+4. Encoder
+
+encoder 옵션: e2vid / e2vidplus / etnet
+입력 한 step: [B, 5, H, W]
+출력 한 step: [B, 32, H, W] 및 3단계 ConvLSTM state
+
+E2VID 계열은 U-Net 형태이며 채널 폭은 32/64/128/256이다.
+E2VID+ encoder는 normalization을 사용하지 않는 변형이다.
+ET-Net encoder는 recurrent convolution과 다중 scale Transformer를 결합한다.
+공간 크기는 내부적으로 8의 배수로 padding한 뒤 원래 크기로 crop한다.
+
+encoder 옵션 선택만으로 pretrained weight를 로드하지 않는다.
+새 학습에서는 encoder와 decoder를 함께 초기화하고 함께 최적화한다.
+resume은 저장된 EventINR checkpoint 전체를 복원하는 기능이다.
+
+5. 공간·시간 특징 질의
+
+공간:
+  grid_sample의 bilinear sampling을 사용한다.
+  align_corners=False, padding_mode=border.
+  pixel-center 좌표는 x=2*(column+0.5)/W-1,
+  y=2*(row+0.5)/H-1이다.
+
+시간:
+  인접한 두 feature timestamp 사이에서 실제 timestamp 비율로 선형 보간한다.
+  F(x,y,t) = (1-alpha)*F_left(x,y) + alpha*F_right(x,y)
+  alpha = (t-t_left)/(t_right-t_left)
+  timestamp는 엄격하게 증가해야 하며 float64를 사용한다.
+  query 지원 범위는 [첫 feature timestamp, 마지막 feature timestamp]다.
+  첫 voxel 이전의 구간으로 extrapolation하지 않는다.
+
+crop:
+  decoder의 xy는 전체 sensor 기준 좌표를 유지한다.
+  sample_scale/sample_shift를 context에 넣어 해당 좌표를 cropped feature
+  grid 좌표로 변환한다. decoder 좌표와 sampling 좌표를 혼동하지 말아야 한다.
+
+6. Decoder와 시간 모드
+
+decoder_type=siren:
+  32채널 특징과 선택한 원래 좌표를 입력한다.
+  hidden activation은 sine, omega는 30, 기본 hidden width는 256 네 층이다.
+
+decoder_type=relu_fourier:
+  좌표에 sin/cos Fourier encoding을 적용한 뒤 특징과 결합한다.
+  frequencies = pi * 2**arange(fourier_bands)
+  기본 hidden width는 256 네 층, activation은 ReLU다.
+  입력 차원은 32 + 2*coord_dim*fourier_bands다.
+
+coord_dim:
+  1: t / 2: xy / 3: xyt
+  t-only여도 특징 F(x,y,t)의 공간 정보는 계속 사용한다.
+  xy-only여도 시간에 따라 보간되는 특징은 계속 사용한다.
+
+time_mode:
+  local: 현재 encoded clip의 첫/마지막 feature 시각을 기준으로 [-1,1] 정규화.
+         일부 query만 요청해도 context가 같으면 시간 좌표가 바뀌지 않는다.
+  alpha: 둘러싸는 feature interval 내부의 phase를 [-1,1]로 표현.
+         endpoint의 phase와 다음 interval 시작부 사이에 좌표 불연속 가능성이 있다.
+  feature: decoder time 좌표를 생략. coord_dim=2만 허용한다.
+  global: sequence time_origin 이후 elapsed time. 모델/legacy checkpoint에는
+          지원이 남아 있지만 현재 train.py CLI에서는 선택할 수 없다.
+
+현재 학습은 feature_norm=none이다.
+모델 클래스 자체에는 affine parameter 없는 LayerNorm 옵션도 있다.
+
+7. 출력값의 의미: 매우 중요
+
+intensity_head=sigmoid:
+  model.query/render 반환값 = log(sigmoid(raw))
+  실제 intensity = exp(output) = sigmoid(raw), 범위 (0,1)
+
+intensity_head=linear:
+  model.query/render 반환값 = raw intensity
+  학습에서는 exp/sigmoid/clamp를 적용하지 않는다.
+  음수와 1 초과 출력도 허용한다.
+  이 head는 decoder_type=relu_fourier에서만 허용된다.
+
+losses.to_intensity()를 사용하면 head에 맞게 변환할 수 있다.
+linear head에서도 일부 변수명에 log가 남아 있으므로 변수명만 보고 exp하면 안 된다.
+GT는 uint8 grayscale을 255로 나눈 [0,1] intensity다.
+
+8. 데이터 형식과 augmentation
+
+manifest:
+  한 줄에 source 경로 하나. 상대 경로는 manifest 파일의 부모 기준이다.
+  빈 줄과 # 주석 줄은 제외한다.
+
+NPY source:
+  frames/timestamps.txt 및 frame_XXXXXXXXXX.png
+  VoxelGrid-betweenframes-5/timestamps.txt 및 event_tensor_XXXXXXXXXX.npy
+  각 voxel은 인접 GT frame 사이의 이벤트이며 오른쪽 GT 시각과 연결된다.
+  read(first,S)는 S개 voxel과 S+1개 timestamp/GT를 반환한다.
+  학습 clip stride는 1이다.
+
+H5 source:
+  events/{ts,xs,ys,ps}, images/<key>를 읽는다.
+  image attribute의 timestamp와 event_idx를 사용한다.
+  event polarity는 0/1이며 voxel 생성 시 -1/+1로 변환한다.
+  시간 방향 triangular splatting으로 5개 bin에 signed event를 누적한다.
+  H5 학습 packet은 저장된 event_idx를 그대로 사용하고 packet 0은 event 0부터다.
+  H5 평가 read()는 GT timestamp의 half-open interval을 사용하며 index를 검증한다.
+  H5 학습 clip stride는 S이고, 코드상 len(sequence)<=S이면 해당 source를 제외한다.
+
+augmentation 기본값은 활성화다.
+NPY: clip 전체에 같은 random crop/상하좌우 flip 및 virtual pause 적용.
+H5: 같은 crop/flip, virtual pause, noise, hot pixel augmentation 적용.
+pause에서는 원래 진행하던 source frame을 반복하고 이벤트를 0으로 만든다.
+--no_augmentation은 두 형식 모두 augmentation을 끄고 center crop을 사용한다.
+
+중요한 시간축 차이:
+  H5 학습 times는 실제 sensor timestamp가 아니라 균등한 [-1,1] step 축이다.
+  source timestamp는 source_times에 별도 보관하지만 모델 query에는 사용하지 않는다.
+  NPY augmentation은 원래 clip의 time slot을 유지하면서 source packet 진행을 늦춘다.
+  평가에서는 실제 feature timestamp를 사용한다.
+
+voxel_normalization:
+  none: raw voxel 유지
+  nonzero: packet마다 nonzero 값만 mean/std normalization
+  auto: e2vid는 nonzero, 나머지 encoder는 none으로 결정
+  원래 H5 학습 경로는 none만 허용한다.
+
+9. 학습과 loss
+
+run_epoch()는 각 clip 시작 시 recurrent state를 초기화한다.
+clip 내부에서는 state를 detach하지 않아 전체 S step에 gradient가 흐른다.
+GT와 query는 batch['times'][:,1:] 및 batch['target'][:,1:]를 사용한다.
+즉, 현재는 각 feature endpoint의 GT로 학습한다.
+
+Charbonnier:
+  mean(sqrt((I_pred-I_gt)^2 + eps^2) - eps)
+LPIPS:
+  grayscale을 RGB 세 채널로 복제하고 VGG LPIPS를 사용한다.
+  linear head 예측도 학습 중 clamp하지 않는다.
+Temporal consistency:
+  선택적으로 GT 차이 기반 visibility mask와 optical flow warp를 사용한다.
+  H5 경로에서는 검증된 flow가 없으므로 활성화가 거부된다.
+
+현재 objective에는 event 발생식, contrast threshold, event consistency loss가 없다.
+sensor_log()가 정의되어 있지만 현재 학습 objective에서 호출하지 않는다.
+
+optimizer는 Adam(amsgrad=True), gradient norm clipping은 1이다.
+--val이 있으면 PSNR 또는 SSIM 기준 best.pt를 저장한다.
+last.pt, 선택적 epoch checkpoint, history.jsonl, preview 등을 저장한다.
+checkpoint에는 모델/optimizer/설정/epoch/RNG/데이터 recipe가 포함된다.
+
+10. 현재 script_train.sh의 실험
+
+ET-Net + relu_fourier, coord_dim 기본값 3(xyt), fourier_bands=8,
+time_mode=local, LPIPS, temporal_weight=0, voxel_normalization=none,
+crop=112, steps=40, batch_size=2, lr=5e-4, seed=42, epochs=200.
+
+동일 조건에서 linear와 sigmoid intensity head를 순서대로 학습한다.
+--val을 지정하지 않으므로 validation 기반 best checkpoint를 선택하지 않는다.
+스크립트의 DATA/OUT/Conda/SLURM 설정은 현재 서버에 맞게 확인해야 한다.
+
+11. 평가
+
+ECOCO:
+  Sequence.read()로 GT interval을 순차 처리한다.
+  non-overlapping chunk와 짧은 마지막 chunk를 유지하며 recurrent state를 전달한다.
+  첫 GT 경계 이후 frame을 평가한다. raw intensity L1/MSE/PSNR/SSIM/bias를 계산한다.
+
+ECD/HQF/MVSEC/Custom:
+  EVREAL memmap: events_ts.npy, events_xy.npy, events_p.npy,
+  images.npy, images_ts.npy, image_event_indices.npy를 읽는다.
+  packet j는 events[index[j-1]:index[j]], packet 0은 빈 voxel이다.
+  EVREAL 규약에 맞춰 마지막 GT frame을 제외한다.
+  recurrent warmup은 score 시작 최대 10초 전부터다.
+  Custom score 시작값은 source clock의 5초이며, 첫 frame 이후 5초라는 뜻이 아니다.
+  외부 EVREAL config/dataset/*.json 및 config/eval/std.json을 읽는다.
+  Ours 평가 경로는 EVREAL Python 모델을 import하지 않는다.
+
+metric:
+  L1, MSE, PSNR, SSIM, 선택적 LPIPS, brightness bias.
+  benchmark LPIPS는 AlexNet을 사용하므로 학습 VGG LPIPS와 다르다.
+  frame별 metric을 평균하고 sequence 간에는 frame 수로 가중 평균한다.
+  benchmark 결과에는 summary.csv, benchmark.json, sequence metrics.json,
+  선택적 events/recon/gt.mp4, video_index.csv, PNG 등이 포함된다.
+  benchmark 영상은 source sample당 한 frame이며 중간 시점 질의를 생성하지 않는다.
+
+tone_mapping:
+  none: sigmoid head는 exp(output), linear head는 benchmark 경로에서 [0,1] clamp.
+  clahe: native intensity 변환 후 예측과 GT 각각에 OpenCV CLAHE 적용.
+         clipLimit=2.0, tileGridSize=(8,8), uint8 변환을 거친다.
+  evinr_code: sigmoid(log_output)^(1/gamma)를 적용하는 별도 legacy 변환.
+             native intensity 변환과 의미가 다르다.
+
+ECOCO raw validation은 linear 출력에 clamp하지 않지만 memmap benchmark는 clamp한다.
+절대 밝기 정확도와 CLAHE 이후 결과, raw/clamped 결과를 구분해 해석해야 한다.
+
+12. 연속 복원 기능과 아직 검증되지 않은 부분
+
+query()는 feature support 안에서 임의 실수 timestamp를 지원한다.
+render()는 출력 H/W를 지정할 수 있다.
+그러나 현재 학습과 benchmark는 endpoint GT만 사용한다.
+중간 timestamp의 reconstruction 성능이나 spatial super-resolution 성능은
+이 기능이 존재한다는 이유만으로 입증되지 않는다.
+
+endpoint 출력의 특징은 해당 시점까지의 이벤트로 계산되므로 인과적이다.
+반면 interval 중간 query는 오른쪽 feature가 필요해 해당 query 시점 이후의
+이벤트까지 기다려야 한다. 임의 시점 질의를 모두 zero-lookahead로 부르면 안 된다.
+
+local 시간 좌표는 chunk의 첫/마지막 feature에 의존한다.
+같은 시점이어도 chunk 구성이 달라지면 decoder 시간 좌표가 달라질 수 있다.
+또한 non-overlapping context 사이의 빈 구간을 자동으로 보간하지 않는다.
+stream 전체의 연속 질의를 구현하려면 경계 feature 연결 정책도 필요하다.
+
+학습은 clip마다 state를 초기화하고 평가는 sequence 내부에서 유지한다.
+H5 학습의 ordinal 시간과 평가의 실제 시간 간 차이도 고려해야 한다.
+
+13. 코드상 확인한 실행 이슈와 비용
+
+script_eval.sh의 RUN/EXP_NAME은 현재 script_train.sh의 출력 경로와 다르다.
+script_eval_pretrained.sh는 ECD/HQF 평가 후 같은 OUT에 대해
+디렉터리가 없어야 한다는 검사를 반복해 MVSEC 이전에 종료될 수 있다.
+외부 경로가 hardcode되어 있어 로컬 실행 전 수정이 필요하다.
+
+ET-Net의 global attention은 공간 token 수에 대해 메모리 비용이 제곱으로 증가한다.
+query()는 모든 feature step에서 Q개 위치를 sampling하고 decoder도
+모든 B*T*Q 입력에 적용하므로 full-resolution/long-clip에서 메모리가 커진다.
+현재 render()에는 query chunking이 없다.
+
+작성 시점 저장소에는 README, 의존성 명세, 데이터, checkpoint, 실험 결과가 없다.
+일부 backbone 주석의 vendor 출처 문서도 현재 파일 목록에서 확인되지 않는다.
+이 설명만으로 pretrained 성능이나 원본 구현과의 완전한 동등성을 주장하지 않는다.
+
+14. 수행한 확인과 범위
+
+Python 소스 18개의 AST 문법 검사 및 실행 shell script의 bash 문법 검사를 통과했다.
+작은 synthetic 입력에서 E2VID+ encoder와 작은 decoder width를 사용해
+SIREN+sigmoid, Fourier ReLU+sigmoid, Fourier ReLU+linear의
+forward/중간 시점 query/Charbonnier backward를 확인했다.
+feature support 밖 query가 거부되는 것도 확인했다.
+
+이 검사는 실제 ET-Net full-size 학습, LPIPS 학습, 데이터 로더 정합성,
+checkpoint 호환성, benchmark 품질을 검증한 것은 아니다.
+확인 당시 기본 python3 환경에는 lpips가 없었고 python 명령도 없었다.
+별도 Conda 환경의 설치 상태는 확인하지 않았다.
+
+GPT가 후속 분석할 때는 실제 실행 경로, tensor shape, intensity head,
+timestamp 축, packet/GT 정렬, metric 후처리를 먼저 확인하면 된다.
+새 실험 제안과 현재 구현된 기능, 실제 측정한 결과를 구분해서 설명한다.
